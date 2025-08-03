@@ -153,8 +153,8 @@ class TinyViTInference:
 if __name__ == "__main__":
     
     image_path = 'images/dog.jpg'
-    variant = "21m_22k_224"
-    device = "cpu"  # 'cuda'
+    variant = "21m_22k_384"
+    device = "cuda"  # 'cpu'
 
     classifier = TinyViTInference(variant=variant, device=device)
 
