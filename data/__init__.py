@@ -1,3 +1,2 @@
 from .build import build_loader, build_transform
 from .imagenet_classnames import imagenet_classnames
-from .imagenet22k_classnames import imagenet22k_classnames
