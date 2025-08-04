@@ -1,4 +1,4 @@
 __pycache__
-checkpoints/**/*.pth
+checkpoints/*
 dataset/*
 logs/*

@@ -1,6 +1,14 @@
+torch
+torchvision
+pillow
+numpy
+tqdm
+matplotlib
+scikit-learn
 timm
 yacs
 termcolor
 wandb
 pyyaml
 seaborn
+tensorboard

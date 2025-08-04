@@ -44,7 +44,7 @@ class TinyViTInference:
         
         self.model = self.__get_model__().to(self.device)
 
-        checkpoint = torch.load(weights_path, map_location=self.device)
+        checkpoint = torch.load(weights_path, map_location=self.device, weights_only=True)
         self.model.load_state_dict(checkpoint['model'], strict=False)
 
         self.model.eval()

@@ -3,6 +3,9 @@ TinyViT Inference Script
 
 Load a fine-tuned TinyViT model and perform inference on images
 '''
+# ignore UserWarning: Overwriting tiny_vit_5m_224 in registry with models.tiny_vit.tiny_vit_5m_224
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="models.tiny_vit")
 
 import os
 import json
@@ -63,7 +66,7 @@ def load_trained_model(checkpoint_path, labels_path, config_path, device):
         img_size: Expected input image size
     """
     # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     
     # Get model parameters from checkpoint
     num_classes = checkpoint['num_classes']
@@ -183,12 +186,10 @@ def predict_batch(model, image_paths, class_labels, transform, device):
     return batch_predictions
 
 
-def main():
-    """Example usage of the inference functions"""
-    
+if __name__ == "__main__":
     # Paths to saved model files
-    checkpoint_path = "checkpoints/tiny_vit_21m_384_finetuned.pth"
-    labels_path = "checkpoints/finetuned_classes.json"
+    checkpoint_path = "checkpoints/finetune/tiny_vit_21m_384_finetuned.pth"
+    labels_path = "checkpoints/finetune/finetuned_classes.json"
     config_path = "configs/higher_resolution/tiny_vit_21m_224to384.yaml"
     
     # Device
@@ -202,7 +203,7 @@ def main():
         )
         
         # Example: Single image prediction
-        image_path = "path/to/your/test_image.jpg"  # Replace with actual image path
+        image_path = 'images/dog.jpg'
         
         if os.path.exists(image_path):
             print(f"\nPredicting image: {image_path}")
@@ -234,7 +235,3 @@ def main():
         print("3. Model config file: configs/22kto1k/tiny_vit_21m_22kto1k.yaml")
     except Exception as e:
         print(f"Error during inference: {e}")
-
-
-if __name__ == "__main__":
-    main()

@@ -31,7 +31,7 @@ from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import confusion_matrix, classification_report
 import matplotlib.pyplot as plt
 import seaborn as sns
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 
 
 def load_model_config(cfg_path):
@@ -72,7 +72,7 @@ def load_pretrained_weights(model, pretrained_path, num_classes, device):
         return model
     
     # Load pretrained state dict
-    pretrained_state = torch.load(pretrained_path, map_location=device)
+    pretrained_state = torch.load(pretrained_path, map_location=device, weights_only=False)
     
     # Handle different checkpoint formats
     if 'model' in pretrained_state:
@@ -150,7 +150,7 @@ def train_epoch(model, train_loader, criterion, optimizer, device, scaler=None, 
         optimizer.zero_grad()
         
         if use_amp and scaler:
-            with autocast():
+            with autocast('cuda'):
                 outputs = model(inputs)
                 loss = criterion(outputs, labels)
             
@@ -224,7 +224,7 @@ def save_class_labels(class_names, save_path):
 
 
 class EarlyStopping:
-    def __init__(self, patience=7, min_delta=0, restore_best_weights=True):
+    def __init__(self, patience=5, min_delta=0, restore_best_weights=True):
         self.patience = patience
         self.min_delta = min_delta
         self.restore_best_weights = restore_best_weights
@@ -268,7 +268,7 @@ cfg_path = "configs/higher_resolution/tiny_vit_21m_224to384.yaml"
 pretrained_path = "checkpoints/tiny_vit_21m_22kto1k_384_distill.pth"
 
 data_dir = "dataset"
-checkpoints_dir = "checkpoints"
+checkpoints_dir = "checkpoints/finetune"
 logs_dir = "logs"
 
 checkpoint_name = "tiny_vit_21m_384_finetuned.pth"
@@ -287,20 +287,25 @@ num_classes = sum(os.path.isdir(os.path.join(train_dir, entry)) for entry in os.
 print("num_classes:", num_classes)
 
 # Training parameters
-img_size = 384  # 224, 512
-batch_size = 6
+img_size = 384  # 224, 384, 512
 
-# Two-stage training parameters
-stage1_epochs = 0  # Frozen backbone training
-stage2_epochs = 1  # Full fine-tuning
+# Two-stage training parameters:
+# Head
+stage1_epochs = 10      # Frozen backbone training
+stage1_lr     = 1e-3    # Higher learning rate for head training
+stage1_batch_size = 32  # Larger batch size for head-only training
+stage1_step_size = 3    # Reduce LR every 3 epochs
+stage1_gamma = 0.7      # More conservative LR reduction
 
-stage1_lr = 1e-3    # Higher learning rate for head training
-stage2_lr = 1e-5    # Lower learning rate for full fine-tuning
-step_size = 3
-gamma = 0.5
+# Body
+stage2_epochs = 4       # Full fine-tuning
+stage2_lr     = 1e-5    # Lower learning rate for full fine-tuning
+stage2_batch_size = 12  # Smaller batch size for full model training
+stage2_step_size = 2    # Reduce LR every 2 epochs
+stage2_gamma = 0.6      # Standard LR reduction
 
 # Mixed precision training
-use_amp = False
+use_amp = True
 
 # Early stopping
 patience = 5
@@ -312,7 +317,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # TensorBoard writer
-writer = SummaryWriter(logs_dir)
+writer = SummaryWriter(logs_dir)  # None
 
 # Transforms
 train_transform = A.Compose([
@@ -346,9 +351,9 @@ test_dataset = datasets.ImageFolder(
     transform=AlbumentationsTransform(eval_transform)
 )
 
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=batch_size)
-test_loader = DataLoader(test_dataset, batch_size=batch_size)
+train_loader = DataLoader(train_dataset, batch_size=stage1_batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=stage1_batch_size)
+test_loader = DataLoader(test_dataset, batch_size=stage1_batch_size)
 
 # Get class names and create class labels mapping
 class_names = train_dataset.classes
@@ -367,7 +372,7 @@ model = get_model(cfg, num_classes, img_size, device)
 model = load_pretrained_weights(model, pretrained_path, num_classes, device)
 
 # Initialize mixed precision scaler
-scaler = GradScaler() if use_amp else None
+scaler = GradScaler('cuda') if use_amp else None
 
 # Loss function
 criterion = nn.CrossEntropyLoss()
@@ -382,7 +387,7 @@ model = freeze_backbone(model)
 # Optimizer and scheduler for stage 1
 optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), 
                        lr=stage1_lr)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=stage1_step_size, gamma=stage1_gamma)
 
 # Early stopping for stage 1
 early_stopping = EarlyStopping(patience=patience)
@@ -399,11 +404,12 @@ for epoch in range(stage1_epochs):
     val_loss, val_acc, val_preds, val_labels = validate_epoch(model, val_loader, criterion, device)
     
     # Log to TensorBoard
-    writer.add_scalar('Stage1/Train_Loss', train_loss, epoch)
-    writer.add_scalar('Stage1/Train_Acc', train_acc, epoch)
-    writer.add_scalar('Stage1/Val_Loss', val_loss, epoch)
-    writer.add_scalar('Stage1/Val_Acc', val_acc, epoch)
-    writer.add_scalar('Stage1/Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
+    if writer:
+        writer.add_scalar('Stage1/Train_Loss', train_loss, epoch)
+        writer.add_scalar('Stage1/Train_Acc', train_acc, epoch)
+        writer.add_scalar('Stage1/Val_Loss', val_loss, epoch)
+        writer.add_scalar('Stage1/Val_Acc', val_acc, epoch)
+        writer.add_scalar('Stage1/Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
     
     print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
     print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
@@ -425,9 +431,13 @@ print("=" * 60)
 # Stage 2: Unfreeze all parameters and fine-tune
 model = unfreeze_all(model)
 
+# Create new data loaders with smaller batch size for stage 2
+train_loader_stage2 = DataLoader(train_dataset, batch_size=stage2_batch_size, shuffle=True)
+val_loader_stage2 = DataLoader(val_dataset, batch_size=stage2_batch_size)
+
 # New optimizer and scheduler for stage 2 with lower learning rate
 optimizer = optim.AdamW(model.parameters(), lr=stage2_lr)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=stage2_step_size, gamma=stage2_gamma)
 
 # Reset early stopping for stage 2
 early_stopping = EarlyStopping(patience=patience)
@@ -437,17 +447,18 @@ for epoch in range(stage2_epochs):
     print(f"\nEpoch {epoch+1}/{stage2_epochs}")
     
     # Train
-    train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, scaler, use_amp)
+    train_loss, train_acc = train_epoch(model, train_loader_stage2, criterion, optimizer, device, scaler, use_amp)
     
     # Validate
-    val_loss, val_acc, val_preds, val_labels = validate_epoch(model, val_loader, criterion, device)
+    val_loss, val_acc, val_preds, val_labels = validate_epoch(model, val_loader_stage2, criterion, device)
     
     # Log to TensorBoard
-    writer.add_scalar('Stage2/Train_Loss', train_loss, global_step + epoch)
-    writer.add_scalar('Stage2/Train_Acc', train_acc, global_step + epoch)
-    writer.add_scalar('Stage2/Val_Loss', val_loss, global_step + epoch)
-    writer.add_scalar('Stage2/Val_Acc', val_acc, global_step + epoch)
-    writer.add_scalar('Stage2/Learning_Rate', optimizer.param_groups[0]['lr'], global_step + epoch)
+    if writer:
+        writer.add_scalar('Stage2/Train_Loss', train_loss, global_step + epoch)
+        writer.add_scalar('Stage2/Train_Acc', train_acc, global_step + epoch)
+        writer.add_scalar('Stage2/Val_Loss', val_loss, global_step + epoch)
+        writer.add_scalar('Stage2/Val_Acc', val_acc, global_step + epoch)
+        writer.add_scalar('Stage2/Learning_Rate', optimizer.param_groups[0]['lr'], global_step + epoch)
     
     print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
     print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
@@ -471,9 +482,10 @@ model_save_dict = {
     'labels_file': labels_name
 }
 
-torch.save(model_save_dict, os.path.join(checkpoints_dir, checkpoint_name))
+checkpoint_savepath = os.path.join(checkpoints_dir, checkpoint_name)
+torch.save(model_save_dict, checkpoint_savepath)
 
-print(f"\nModel saved to {os.path.join(checkpoints_dir, checkpoint_name)}")
+print(f"\nModel saved to {checkpoint_savepath}")
 print(f"Class labels saved to {labels_path}")
 
 # Final evaluation on test set
@@ -500,7 +512,8 @@ test_acc = test_correct / test_total
 print(f"Test Accuracy: {test_acc:.4f}")
 
 # Log final test accuracy
-writer.add_scalar('Final/Test_Acc', test_acc, 0)
+if writer:
+    writer.add_scalar('Final/Test_Acc', test_acc, 0)
 
 # Generate confusion matrix
 cm_path = os.path.join(logs_dir, 'confusion_matrix.png')
@@ -532,7 +545,8 @@ summary_info = {
         'stage2_lr': stage2_lr
     },
     'image_size': img_size,
-    'batch_size': batch_size
+    'stage1_batch_size': stage1_batch_size,
+    'stage2_batch_size': stage2_batch_size
 }
 
 summary_path = os.path.join(logs_dir, 'training_summary.json')
@@ -541,6 +555,7 @@ with open(summary_path, 'w') as f:
 
 print(f"Training summary saved to {summary_path}")
 
-writer.close()
-print(f"\nTensorBoard logs saved to {logs_dir}")
+if writer:
+    writer.close()
+    print(f"\nTensorBoard logs saved to {logs_dir}")
 print("Training complete!")
