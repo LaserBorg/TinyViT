@@ -1,4 +1,12 @@
+# tmp
 __pycache__
-checkpoints/*
+
+# download pth from Model Zoo
+checkpoints/*.pth
+
+# exclude datasets but keep link to example
 dataset/*
-logs/*
+!dataset/example-dataset-url.txt
+
+# exclude finetunes
+output/*

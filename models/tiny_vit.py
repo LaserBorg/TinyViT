@@ -16,12 +16,7 @@ import torch.utils.checkpoint as checkpoint
 import timm
 from timm.layers import DropPath as TimmDropPath, to_2tuple, trunc_normal_
 from timm.models import register_model
-try:
-    # timm.__version__ >= "0.6"
-    from timm.models._builder import build_model_with_cfg
-except (ImportError, ModuleNotFoundError):
-    # timm.__version__ < "0.6"
-    from timm.models.helpers import build_model_with_cfg
+from timm.models._builder import build_model_with_cfg
 
 
 class Conv2d_BN(torch.nn.Sequential):

@@ -1,13 +1,5 @@
 '''
 TinyViT Training with Pretrained Weights and Two-Stage Fine-tuning
-
-Features:
-- Load pretrained weights from checkpoint
-- Two-stage training: frozen backbone + full fine-tuning
-- Early stopping
-- TensorBoard logging
-- Mixed precision training
-- Confusion matrix
 '''
 
 import warnings
@@ -19,19 +11,21 @@ import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import datasets
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
-from models.tiny_vit import TinyViT
+from torch.utils.tensorboard import SummaryWriter
+from torchvision import datasets
 from tqdm import tqdm
 from PIL import Image
 import numpy as np
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import confusion_matrix, classification_report
 import matplotlib.pyplot as plt
 import seaborn as sns
-from torch.amp import GradScaler, autocast
+from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+
+from models.tiny_vit import TinyViT
 
 
 def load_model_config(cfg_path):
@@ -140,8 +134,73 @@ def unfreeze_all(model):
     return model
 
 
-def train_epoch(model, train_loader, criterion, optimizer, device, scaler=None, use_amp=True):
+def set_weight_decay(model, weight_decay=1e-8):
+    """
+    Set weight decay like TinyViT official implementation
+    Excludes bias and normalization layers from weight decay
+    """
+    # Skip weight decay for these parameter types
+    skip_keywords = ['bias', 'norm', 'bn', 'ln']
+    
+    has_decay = []
+    no_decay = []
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue  # frozen weights
+        
+        # Check if parameter should skip weight decay
+        skip = False
+        for keyword in skip_keywords:
+            if keyword in name.lower():
+                skip = True
+                break
+        
+        # Also skip weight decay for 1D parameters (typically bias, norm layers)
+        if len(param.shape) == 1:
+            skip = True
+            
+        if skip:
+            no_decay.append(param)
+        else:
+            has_decay.append(param)
+    
+    print(f"Weight decay applied to {len(has_decay)} parameters, skipped for {len(no_decay)} parameters")
+    return [{'params': has_decay, 'weight_decay': weight_decay},
+            {'params': no_decay, 'weight_decay': 0.}]
+
+
+def get_cosine_scheduler_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr=1e-5):
+    """
+    Create a cosine annealing scheduler with warmup like TinyViT
+    """
+    from torch.optim.lr_scheduler import LambdaLR
+    import math
+    
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        cosine_lr = 0.5 * (1 + math.cos(math.pi * progress))
+        
+        # Ensure minimum learning rate
+        base_lr = optimizer.param_groups[0]['lr']
+        min_lr_ratio = min_lr / base_lr
+        return max(cosine_lr, min_lr_ratio)
+    
+    return LambdaLR(optimizer, lr_lambda)
+
+
+def train_epoch(model, train_loader, criterion, optimizer, device, scaler=None, use_amp=True, eval_bn=True):
     model.train()
+    
+    # Set batch norm to eval mode during training (TinyViT best practice)
+    if eval_bn:
+        for m in model.modules():
+            if isinstance(m, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)):
+                m.eval()
+    
     train_loss, train_correct, train_total = 0.0, 0, 0
     
     for inputs, labels in tqdm(train_loader, desc="Training"):
@@ -155,12 +214,17 @@ def train_epoch(model, train_loader, criterion, optimizer, device, scaler=None, 
                 loss = criterion(outputs, labels)
             
             scaler.scale(loss).backward()
+            # Gradient clipping like TinyViT
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             outputs = model(inputs)
             loss = criterion(outputs, labels)
             loss.backward()
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
         
         train_loss += loss.item()
@@ -264,12 +328,12 @@ class AlbumentationsTransform:
 
 
 # Settings
-cfg_path = "configs/higher_resolution/tiny_vit_21m_224to384.yaml"
+cfg_path = "checkpoints/tiny_vit_21m_224to384.yaml"
 pretrained_path = "checkpoints/tiny_vit_21m_22kto1k_384_distill.pth"
 
 data_dir = "dataset"
-checkpoints_dir = "checkpoints/finetune"
-logs_dir = "logs"
+output_dir = "output"
+logs_dir = "output/logs"
 
 checkpoint_name = "tiny_vit_21m_384_finetuned.pth"
 labels_name = "finetuned_classes.json"
@@ -279,7 +343,7 @@ test_dir = os.path.join(data_dir, "test")
 val_dir = os.path.join(data_dir, "val")
 
 # Create directories
-os.makedirs(checkpoints_dir, exist_ok=True)
+os.makedirs(output_dir, exist_ok=True)
 os.makedirs(logs_dir, exist_ok=True)
 
 # Count classes
@@ -289,29 +353,31 @@ print("num_classes:", num_classes)
 # Training parameters
 img_size = 384  # 224, 384, 512
 
-# Two-stage training parameters:
-# Head
-stage1_epochs = 10      # Frozen backbone training
-stage1_lr     = 1e-3    # Higher learning rate for head training
+# Two-stage training parameters
+# Head - Stage 1
+stage1_epochs = 15       # Frozen backbone training
+stage1_lr     = 1e-3    # Higher learning rate for head training  
+stage1_warmup_epochs = 1 # Warmup epochs for stage 1
+stage1_min_lr = 1e-5    # Minimum LR for cosine annealing
 stage1_batch_size = 32  # Larger batch size for head-only training
-stage1_step_size = 3    # Reduce LR every 3 epochs
-stage1_gamma = 0.7      # More conservative LR reduction
 
-# Body
-stage2_epochs = 4       # Full fine-tuning
-stage2_lr     = 1e-5    # Lower learning rate for full fine-tuning
+# Body - Stage 2  
+stage2_epochs = 5      # Full fine-tuning
+stage2_lr     = 2.5e-4  # Lower learning rate for full fine-tuning (TinyViT default)
+stage2_warmup_epochs = 2 # Warmup epochs for stage 2  
+stage2_min_lr = 1e-5    # Minimum LR for cosine annealing
 stage2_batch_size = 12  # Smaller batch size for full model training
-stage2_step_size = 2    # Reduce LR every 2 epochs
-stage2_gamma = 0.6      # Standard LR reduction
+layer_lr_decay = 0.8    # Layer-wise learning rate decay (TinyViT default)
 
 # Mixed precision training
 use_amp = True
 
 # Early stopping
-patience = 5
+patience = 7
 
-mean = [0.485, 0.456, 0.406]
-std = [0.229, 0.224, 0.225]
+# ImageNet normalization
+mean = IMAGENET_DEFAULT_MEAN  # [0.485, 0.456, 0.406]
+std = IMAGENET_DEFAULT_STD  # [0.229, 0.224, 0.225]
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -323,8 +389,13 @@ writer = SummaryWriter(logs_dir)  # None
 train_transform = A.Compose([
     A.Resize(img_size, img_size),
     A.HorizontalFlip(p=0.5),
-    A.Rotate(limit=10, p=0.5),
-    A.ColorJitter(brightness=0.1, contrast=0.1, p=0.5),
+    A.Rotate(limit=15, p=0.5),
+    A.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1, p=0.8),
+    A.OneOf([
+        A.GaussNoise(var_limit=(10.0, 50.0), p=0.5),
+        A.GaussianBlur(blur_limit=(3, 5), p=0.5),
+    ], p=0.2),
+    A.CoarseDropout(max_holes=8, max_height=32, max_width=32, p=0.25),  # Random erasing equivalent
     A.Normalize(mean=mean, std=std),
     ToTensorV2()
 ])
@@ -360,7 +431,7 @@ class_names = train_dataset.classes
 print(f"Classes found: {class_names}")
 
 # Save class labels in JSON format
-labels_path = os.path.join(checkpoints_dir, labels_name)
+labels_path = os.path.join(output_dir, labels_name)
 class_labels_dict = save_class_labels(class_names, labels_path)
 
 # Load config and build model
@@ -384,10 +455,14 @@ print("=" * 60)
 # Stage 1: Freeze backbone and train only the head
 model = freeze_backbone(model)
 
-# Optimizer and scheduler for stage 1
-optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), 
-                       lr=stage1_lr)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=stage1_step_size, gamma=stage1_gamma)
+# Optimizer and scheduler for stage 1 with improved weight decay
+param_groups = set_weight_decay(model, weight_decay=1e-8)  # TinyViT low weight decay
+optimizer = optim.AdamW(param_groups, lr=stage1_lr, eps=1e-8, betas=(0.9, 0.999))
+
+# Cosine annealing scheduler with warmup
+total_steps = stage1_epochs * len(train_loader)
+warmup_steps = stage1_warmup_epochs * len(train_loader)
+scheduler = get_cosine_scheduler_with_warmup(optimizer, warmup_steps, total_steps, stage1_min_lr)
 
 # Early stopping for stage 1
 early_stopping = EarlyStopping(patience=patience)
@@ -398,7 +473,7 @@ for epoch in range(stage1_epochs):
     print(f"\nEpoch {epoch+1}/{stage1_epochs}")
     
     # Train
-    train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, scaler, use_amp)
+    train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, scaler, use_amp, eval_bn=True)
     
     # Validate
     val_loss, val_acc, val_preds, val_labels = validate_epoch(model, val_loader, criterion, device)
@@ -436,8 +511,13 @@ train_loader_stage2 = DataLoader(train_dataset, batch_size=stage2_batch_size, sh
 val_loader_stage2 = DataLoader(val_dataset, batch_size=stage2_batch_size)
 
 # New optimizer and scheduler for stage 2 with lower learning rate
-optimizer = optim.AdamW(model.parameters(), lr=stage2_lr)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=stage2_step_size, gamma=stage2_gamma)
+param_groups = set_weight_decay(model, weight_decay=1e-8)  # TinyViT low weight decay
+optimizer = optim.AdamW(param_groups, lr=stage2_lr, eps=1e-8, betas=(0.9, 0.999))
+
+# Cosine annealing scheduler with warmup for stage 2
+total_steps = stage2_epochs * len(train_loader_stage2)  
+warmup_steps = stage2_warmup_epochs * len(train_loader_stage2)
+scheduler = get_cosine_scheduler_with_warmup(optimizer, warmup_steps, total_steps, stage2_min_lr)
 
 # Reset early stopping for stage 2
 early_stopping = EarlyStopping(patience=patience)
@@ -447,7 +527,7 @@ for epoch in range(stage2_epochs):
     print(f"\nEpoch {epoch+1}/{stage2_epochs}")
     
     # Train
-    train_loss, train_acc = train_epoch(model, train_loader_stage2, criterion, optimizer, device, scaler, use_amp)
+    train_loss, train_acc = train_epoch(model, train_loader_stage2, criterion, optimizer, device, scaler, use_amp, eval_bn=True)
     
     # Validate
     val_loss, val_acc, val_preds, val_labels = validate_epoch(model, val_loader_stage2, criterion, device)
@@ -482,7 +562,7 @@ model_save_dict = {
     'labels_file': labels_name
 }
 
-checkpoint_savepath = os.path.join(checkpoints_dir, checkpoint_name)
+checkpoint_savepath = os.path.join(output_dir, checkpoint_name)
 torch.save(model_save_dict, checkpoint_savepath)
 
 print(f"\nModel saved to {checkpoint_savepath}")
