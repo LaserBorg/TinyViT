@@ -1,11 +1,10 @@
-# TinyViT: Fast Pretraining Distillation for Small Vision Transformers [![Tweet](https://img.shields.io/twitter/url/http/shields.io.svg?style=social)](https://twitter.com/intent/tweet?text=Tiny%20vision%20transformer%20models,%20SOTA%20performance!!&url=https://github.com/microsoft/Cream/tree/main/TinyViT&via=houwen_peng&hashtags=ViT,tiny,efficient)
-
-
-:pushpin: This is an official PyTorch implementation of **[ECCV 2022]** - [TinyViT: Fast Pretraining Distillation for Small Vision Transformers](https://arxiv.org/pdf/2207.10666.pdf).
+# TinyViT Finetuning and Inference
 
 TinyViT is a new family of **tiny and efficient** vision transformers pretrained on **large-scale** datasets with our proposed **fast distillation framework**. The central idea is to **transfer knowledge** from **large pretrained models** to small ones. The logits of large teacher models are sparsified and stored in disk in advance to **save the memory cost and computation overheads**.
 
 :rocket: TinyViT with **only 21M parameters** achieves **84.8%** top-1 accuracy on ImageNet-1k, and **86.5%** accuracy under 512x512 resolutions.
+
+this repo uses the pretrained checkpoints of the original authors but provides a more compact solution for finetuning and inference.
 
 ## Model Zoo
 
@@ -28,43 +27,40 @@ TinyViT-21M                                | IN-1k    |224x224| 83.1  | 96.5  | 
 
 Features:
 - Load pretrained weights from checkpoint
-- Two-stage training: frozen backbone + full fine-tuning
+- Two-stage training: frozen backbone (just head) + full fine-tuning (deep training)
 - Early stopping
-- TensorBoard logging
+- TensorBoard logging and Confusion matrix
 - Mixed precision training
-- Confusion matrix
 
-improvements based on the official TinyViT implementation in `main.py`:
+improvements based on the official TinyViT implementation:
 
 ### 1. Learning Rate Strategy (Major Improvement)
-- **Cosine annealing with warmup** - much better convergence
-- **Layer-wise learning rate decay** (0.8) - follows TinyViT best practices  
-- **Proper warmup periods** (1 epoch for stage 1, 2 epochs for stage 2)
-- **Lower base learning rates** (1e-3 → 1e-3, 1e-5 → 2.5e-4) matching official config
-- **Longer training** (1 + 0 epochs → 5 + 25 epochs = 30 total, matching official)
+- **Cosine annealing with warmup**
+- **Layer-wise learning rate decay** (0.8)
+- **warmup periods** (1 epoch for stage 1, 2 epochs for stage 2)
+- **Low base learning rates** (1e-3 for head, 2.5e-4 for deep training)
 
 ### 2. Weight Decay Optimization
 - **Selective weight decay** - excludes bias and normalization layers
-- **Much lower weight decay** (1e-8) for fine-tuning vs standard 0.05
+- **low weight decay** (1e-8) for fine-tuning vs standard 0.05
 - **Proper parameter grouping** following TinyViT's approach
 
 ### 3. Training Stability Improvements
 - **Gradient clipping** (max_norm=5.0) prevents exploding gradients
-- **BatchNorm in eval mode** during training (TinyViT best practice)
+- **BatchNorm in eval mode** during training
 - **Better mixed precision handling** with unscaling for gradient clipping
 
 ### 4. Enhanced Data Augmentation
-- A.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1, p=0.8)  # TinyViT default
-- A.Rotate(limit=15, p=0.5)  # More rotation
+- A.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1, p=0.8)
+- A.Rotate(limit=15, p=0.5)
 - A.CoarseDropout(max_holes=8, max_height=32, max_width=32, p=0.25)  # Random erasing
-- A.OneOf([GaussNoise, GaussianBlur], p=0.2)  # Additional noise augmentation
+- A.OneOf([GaussNoise, GaussianBlur], p=0.2)  # noise augmentation
 
 ### 5. Training Configuration Updates
-- **5 epochs frozen + 25 epochs fine-tuning** 
-- **Increased patience** (7) for longer training
-- **Better epoch distribution** for two-stage training
+- **15 epochs frozen + 5 epochs fine-tuning** 
+- **Increased patience** (7)
 
-### 6. Key Functions Added
+### 6. Key Functions
 1. `set_weight_decay()` - Proper weight decay handling
 2. `get_cosine_scheduler_with_warmup()` - Advanced LR scheduling  
 3. Enhanced `train_epoch()` with gradient clipping and BN eval mode
